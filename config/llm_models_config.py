@@ -1,0 +1,230 @@
+"""
+Central registry for LLM models → metadata and handler selection.
+Scalable: add entries to MODEL_REGISTRY to support new models/functions.
+"""
+from typing import Callable, Dict, Any, Tuple
+
+from services.open_ai_services import (
+    openai_chat_completion_non_reasoning,
+    openai_chat_completion_reasoning,
+)
+from services.groq_services import groq_chat_completions
+from services.grok_services import grok_chat_completion
+from services.claude_services import claude_chat_completion_non_reasoning
+from services.deepseek_services import deepseek_chat_completion
+
+# Default model if none provided or lookup fails
+DEFAULT_MODEL = "gpt-4o-mini"
+
+# Registry keyed by model name. Each entry can include:
+# - family: logical family/grouping of the model
+# - mode: "chat" | "reasoning" | other future modes
+# - handler: callable that will be invoked for this model
+# - deprecated: optional bool; when True, hide from frontend model pickers
+MODEL_REGISTRY: Dict[str, Dict[str, Any]] = {
+    # Non-reasoning (temperature-enabled) chat
+    "gpt-4o-mini": {
+        "family": "openai-gpt-4o",
+        "mode": "non-reasoning",
+        "handler": openai_chat_completion_non_reasoning,
+    },
+    "gpt-4.1-mini": {
+        "family": "gpt-4.1-mini-2025-04-14",
+        "mode": "non-reasoning",
+        "handler": openai_chat_completion_non_reasoning,
+    },
+    # Defaults to reasoning effort "none", so temperature is valid.
+    "gpt-5.4-mini": {
+        "family": "openai-gpt-5.4-mini",
+        "mode": "non-reasoning",
+        "handler": openai_chat_completion_non_reasoning,
+    },
+    # Reasoning models. Chat Completions text replies only — do not send
+    # temperature or function tools. GPT-5.6 and GPT-6 Sol/Luna default to
+    # reasoning effort "medium" when omitted. GPT-6 Astra does not support "none".
+    "gpt-5-nano-2025-08-07": {
+        "family": "openai-gpt-5-nano",
+        "mode": "reasoning",
+        "handler": openai_chat_completion_reasoning,
+    },
+    "gpt-6-astra": {
+        "family": "openai-gpt-6",
+        "mode": "reasoning",
+        "handler": openai_chat_completion_reasoning,
+    },
+    "gpt-6-sol": {
+        "family": "openai-gpt-6",
+        "mode": "reasoning",
+        "handler": openai_chat_completion_reasoning,
+    },
+    "gpt-6-luna": {
+        "family": "openai-gpt-6",
+        "mode": "reasoning",
+        "handler": openai_chat_completion_reasoning,
+    },
+    "gpt-6.1-sol": {
+        "family": "openai-gpt-6.1",
+        "mode": "reasoning",
+        "handler": openai_chat_completion_reasoning,
+    },
+    "gpt-5.6-sol": {
+        "family": "openai-gpt-5.6",
+        "mode": "reasoning",
+        "handler": openai_chat_completion_reasoning,
+    },
+    "gpt-5.6-terra": {
+        "family": "openai-gpt-5.6",
+        "mode": "reasoning",
+        "handler": openai_chat_completion_reasoning,
+    },
+    "gpt-5.6-luna": {
+        "family": "openai-gpt-5.6",
+        "mode": "reasoning",
+        "handler": openai_chat_completion_reasoning,
+    },
+    # Groq chat
+    "openai/gpt-oss-120b": {
+        "family": "groq",
+        "mode": "reasoning",
+        "handler": groq_chat_completions,
+    },
+    "openai/gpt-oss-20b": {
+        "family": "groq",
+        "mode": "reasoning",
+        "handler": groq_chat_completions,
+    },
+    "qwen/qwen3.8-27b": {
+        "family": "groq",
+        "mode": "reasoning",
+        "handler": groq_chat_completions,
+    },
+     "claude-3-7-sonnet-latest": {
+        "family": "claude",
+        "mode": "non-reasoning",
+        "handler": claude_chat_completion_non_reasoning,
+        "deprecated": True,
+    },
+     "claude-sonnet-4-0": {
+        "family": "claude",
+        "mode": "non-reasoning",
+        "handler": claude_chat_completion_non_reasoning,
+        "deprecated": True,
+    },
+    "claude-sonnet-4-5": {
+        "family": "claude",
+        "mode": "non-reasoning",
+        "handler": claude_chat_completion_non_reasoning,
+    },
+     "claude-haiku-4-5": {
+        "family": "claude",
+        "mode": "non-reasoning",
+        "handler": claude_chat_completion_non_reasoning,
+    },
+    # Adaptive thinking is on by default. The chat handler omits temperature.
+    "claude-sonnet-5": {
+        "family": "claude",
+        "mode": "non-reasoning",
+        "handler": claude_chat_completion_non_reasoning,
+    },
+    # Grok chat. 4.1 fast and grok-code-fast-1 stay API-valid for existing agents.
+    "grok-4-1-fast-non-reasoning": {
+        "family": "grok",
+        "mode": "non-reasoning",
+        "handler": grok_chat_completion,
+        "deprecated": True,
+    },
+    "grok-4-1-fast-reasoning": {
+        "family": "grok",
+        "mode": "reasoning",
+        "handler": grok_chat_completion,
+        "deprecated": True,
+    },
+    "grok-code-fast-1": {
+        "family": "grok",
+        "mode": "non-reasoning",
+        "handler": grok_chat_completion,
+        "deprecated": True,
+    },
+    # Reasoning is always on. Chat sends effort "medium"; xAI does not allow "none".
+    "grok-4.7": {
+        "family": "grok",
+        "mode": "reasoning",
+        "handler": grok_chat_completion,
+    },
+    # DeepSeek chat (OpenAI-compatible API — https://api.deepseek.com)
+    "deepseek-v4-flash": {
+        "family": "deepseek",
+        "mode": "non-reasoning",
+        "handler": deepseek_chat_completion,
+    },
+    "deepseek-v4-pro": {
+        "family": "deepseek",
+        "mode": "non-reasoning",
+        "handler": deepseek_chat_completion,
+    },
+}
+
+SUPPORTED_LLM_MODELS = frozenset(MODEL_REGISTRY.keys())
+
+
+def get_model_config(model_name: str) -> Dict[str, Any]:
+    """
+    Return config for a model; fallback to default model if not found.
+    """
+    if model_name in MODEL_REGISTRY:
+        return MODEL_REGISTRY[model_name]
+    return MODEL_REGISTRY[DEFAULT_MODEL]
+
+
+def resolve_model_handler(model_name: str) -> Tuple[Callable[..., Any], Dict[str, Any]]:
+    """
+    Return (handler, config) for the given model, falling back to default.
+    """
+    config = get_model_config(model_name)
+    handler = config["handler"]
+    return handler, config
+
+
+def validate_llm_model(value) -> tuple[bool, str | None, str | None]:
+    """
+    Validate an llm_model value for atlas agents.
+
+    Returns:
+        (is_valid, normalized_value, error_message)
+    """
+    if value is None:
+        return True, None, None
+
+    if not isinstance(value, str):
+        return False, None, "llm_model must be a string."
+
+    normalized = value.strip()
+    if not normalized:
+        return False, None, "llm_model must be a non-empty string."
+
+    if normalized not in SUPPORTED_LLM_MODELS:
+        allowed = ", ".join(sorted(SUPPORTED_LLM_MODELS))
+        return False, None, f"Invalid llm_model '{value}'. Allowed values: {allowed}."
+
+    return True, normalized, None
+
+
+def normalize_llm_model_in_request(request_data: dict) -> str | None:
+    """
+    If llm_model is present in request_data, validate in place.
+
+    Returns:
+        Error message when invalid, otherwise None.
+    """
+    if "llm_model" not in request_data:
+        return None
+
+    is_valid, normalized, error_message = validate_llm_model(request_data.get("llm_model"))
+    if not is_valid:
+        return error_message
+
+    if normalized is not None:
+        request_data["llm_model"] = normalized
+
+    return None
+

@@ -1,0 +1,629 @@
+from logging_config import get_logger
+from typing import Any, Dict
+from services.elysium_atlas_services.atlas_query_qdrant_services import search_and_merge_agent_knowledge
+from services.elysium_atlas_services.agent_db_operations import get_agent_by_id
+from services.elysium_atlas_services.kb_item.kb_attachment_service import list_ready_kb_ids_for_agent
+from services.socket_emit_services import emit_atlas_response_chunk
+from services.elysium_atlas_services.atlas_chat_session_services import (
+    create_and_store_chat_messages,
+    create_and_store_tool_call_message,
+    get_chat_session_data,
+    get_llm_chat_history_for_session,
+    coerce_utc_datetime,
+    format_utc_datetime_for_client,
+    serialize_chat_message_for_client,
+    stored_message_metadata,
+)
+
+from config.llm_models_config import resolve_model_handler, DEFAULT_MODEL
+from config.atlas_tool_config import get_tool_result_message_role
+from config.atlas_tool_calling_config import normalize_tool_calling_config
+from config.llm_context_config import normalize_llm_context_config
+from config.atlas_chat_config import CHAT_MESSAGE_ROLE_TOOL, CHAT_MESSAGE_ROLES_HIDDEN_FROM_LLM
+from config.retrieval_strategy_config import DEFAULT_RETRIEVAL_STRATEGY
+from services.elysium_atlas_services.atlas_tool_execution_services import (
+    format_stored_tool_message_for_llm,
+    run_agent_tool_calling_round,
+)
+
+import asyncio
+import json
+import time
+import uuid
+import datetime
+
+logger = get_logger()
+
+
+def _utc_now() -> datetime.datetime:
+    return datetime.datetime.now(datetime.timezone.utc)
+
+
+def _resolve_user_message_created_at(additional_params: dict) -> datetime.datetime:
+    """Server-side receive time only; frontend created_at is ignored for storage."""
+    received_timestamp = additional_params.get("_message_received_at")
+    if received_timestamp is not None:
+        return coerce_utc_datetime(received_timestamp)
+    return _utc_now()
+
+
+def _build_agent_message_from_stored(
+    stored_messages: list | None,
+    agent_message_id: str,
+    response_text: str,
+    agent_message_created_at: datetime.datetime,
+) -> Dict[str, Any] | None:
+    """Serialize the stored AI agent message for socket/API payloads."""
+    agent_stored = next(
+        (doc for doc in (stored_messages or []) if doc.get("role") == "agent"),
+        None,
+    )
+    if agent_stored:
+        return serialize_chat_message_for_client(agent_stored)
+
+    if not response_text:
+        return None
+
+    return serialize_chat_message_for_client(
+        {
+            "message_id": agent_message_id,
+            "role": "agent",
+            "content": response_text,
+            "created_at": agent_message_created_at,
+        }
+    )
+
+
+def format_knowledge_base_string(final_results: list) -> str:
+    """
+    Format the final_results list into a knowledge base string for LLM consumption.
+    
+    Args:
+        final_results (list): List of knowledge source objects with metadata and content
+    
+    Returns:
+        str: Formatted knowledge base string
+    """
+    knowledge_sections = []
+    
+    for result in final_results:
+        # Build metadata line with only non-falsy values
+        metadata_parts = []
+        
+        knowledge_source = result.get("knowledge_source", "")
+        if knowledge_source:
+            metadata_parts.append(f"[knowledge_source: {knowledge_source}]")
+
+        if result.get("source_type"):
+            metadata_parts.append(f'source_type: "{result["source_type"]}"')
+        
+        # Add optional fields only if they have non-falsy values
+        if result.get("summary"):
+            metadata_parts.append(f'summary: "{result["summary"]}"')
+        
+        if result.get("product_name"):
+            metadata_parts.append(f'product_name: "{result["product_name"]}"')
+        
+        if result.get("product_id"):
+            metadata_parts.append(f'product_id: "{result["product_id"]}"')
+        
+        if result.get("category"):
+            metadata_parts.append(f'category: "{result["category"]}"')
+        
+        if result.get("price") is not None:  # Check explicitly for None since 0 could be valid
+            metadata_parts.append(f'price: {result["price"]}')
+        
+        if result.get("currency"):
+            metadata_parts.append(f'currency: "{result["currency"]}"')
+        
+        if result.get("is_available") is not None:  # Check explicitly for None
+            metadata_parts.append(f'is_available: {result["is_available"]}')
+        
+        # Join metadata parts with space
+        metadata_line = " ".join(metadata_parts)
+        
+        # Add text_content if available
+        text_content = result.get("text_content", "")
+        if text_content:
+            section = f"{metadata_line}\n\n{text_content}"
+        else:
+            section = metadata_line
+        
+        knowledge_sections.append(section)
+    
+    # Join all sections with separator
+    return "\n\n###\n\n".join(knowledge_sections)
+
+
+def build_messages_list(
+    agent_data: dict,
+    message: str,
+    knowledge_base_string: str,
+    chat_history: list = None,
+    tool_turn_messages: list | None = None,
+    tool_result_role: str = "assistant",
+    lead_collection_prompt: str | None = None,
+    human_handover_prompt: str | None = None,
+) -> list:
+    """
+    Build an OpenAI-style messages list with system prompt, chat history, knowledge base,
+    optional tool-call messages, and the current user message last.
+    """
+    messages = []
+
+    # Platform-only preamble. Identity, tone, and formatting live on the stored system_prompt.
+    now_utc = _utc_now()
+    today_utc_line = (
+        f"Today's date is {now_utc.day} {now_utc.strftime('%B %Y')} "
+        f"and the current time is {now_utc.strftime('%H:%M')} UTC."
+    )
+    agent_name = (agent_data.get("agent_name") or "").strip() if agent_data else ""
+    agent_name_line = f"Your name is {agent_name}.\n" if agent_name else ""
+    messages.append({
+        "role": "system",
+        "content": (
+            f"{today_utc_line}\n"
+            f"{agent_name_line}"
+            "Generate a clear, accurate, and helpful response that sounds natural and conversational.\n"
+            "Use clean Markdown only when it improves readability.\n"
+            "Follow the agent's system prompt for identity, tone, and formatting.\n"
+            "Never reveal tool names, request/result JSON, or internal tool-call details."
+        )
+    })
+
+    # --- Agent-specific system prompt ---
+    system_prompt = agent_data.get("system_prompt") if agent_data else None
+    if system_prompt:
+        messages.append({
+            "role": "system",
+            "content": system_prompt
+        })
+
+    if lead_collection_prompt:
+        messages.append({
+            "role": "system",
+            "content": lead_collection_prompt,
+        })
+
+    if human_handover_prompt:
+        messages.append({
+            "role": "system",
+            "content": human_handover_prompt,
+        })
+
+    # --- Chat History ---
+    VALID_ROLES = {"system", "assistant", "user", "function", "tool", "developer"}
+    if chat_history:
+        for hist_msg in chat_history:
+            raw_role = hist_msg.get("role", "user")
+            if raw_role == CHAT_MESSAGE_ROLE_TOOL:
+                messages.append({
+                    "role": tool_result_role,
+                    "content": format_stored_tool_message_for_llm(hist_msg),
+                })
+                continue
+            if raw_role in CHAT_MESSAGE_ROLES_HIDDEN_FROM_LLM:
+                continue
+            if raw_role in ("agent", "human"):
+                role = "assistant"
+            elif raw_role in VALID_ROLES:
+                role = raw_role
+            else:
+                role = "system"
+            messages.append({
+                "role": role,
+                "content": hist_msg.get("content", "")
+            })
+
+    # --- Knowledge Base (RAG context) ---
+    if knowledge_base_string:
+        messages.append({
+            "role": "user",
+            "content": (
+                "The following information is provided as a Knowledge Base that may "
+                "help you answer the user's question.\n\n"
+                "Guidelines:\n"
+                "- Use this Knowledge Base when it is relevant or helpful\n"
+                "- If the Knowledge Base contains useful information, incorporate it "
+                "naturally into your response\n\n"
+                "Knowledge Base:\n\n"
+                f"{knowledge_base_string}"
+            )
+        })
+
+    # --- Tool result messages (before current user message; role varies by final model) ---
+    if tool_turn_messages:
+        for tool_msg in tool_turn_messages:
+            messages.append({
+                "role": tool_result_role,
+                "content": tool_msg.get("content", ""),
+            })
+
+    # --- Current user message (always last) ---
+    messages.append({
+        "role": "user",
+        "content": message
+    })
+
+    return messages
+
+
+async def chat_with_agent_v1(agent_id, message, sid=None, chat_session_id=None, additional_params: dict = {}):
+    chat_log = f"[chat agent_id={agent_id}]"
+    request_started_at = additional_params.get("_request_started_at")
+    step_start = time.perf_counter()
+    try:
+        logger.info(f"{chat_log} Processing visitor message")
+
+        user_message_id = additional_params.get("_user_message_id") or str(uuid.uuid4())
+        agent_message_id = str(uuid.uuid4())
+        user_message_created_at = _resolve_user_message_created_at(additional_params)
+
+        logger.info(f"{chat_log} Loading chat session, agent config, and ready KB attachments")
+        chat_session_data, agent_data, ready_kb_ids = await asyncio.gather(
+            get_chat_session_data({
+                "agent_id": agent_id,
+                "chat_session_id": chat_session_id,
+                "limit": 10,
+                "exclude_roles": list(CHAT_MESSAGE_ROLES_HIDDEN_FROM_LLM),
+            }),
+            get_agent_by_id(agent_id),
+            list_ready_kb_ids_for_agent(agent_id),
+        )
+        tool_calling_config = normalize_tool_calling_config(
+            (agent_data or {}).get("tool_calling_config")
+        )
+        llm_context_config = normalize_llm_context_config(
+            (agent_data or {}).get("llm_context_config")
+        )
+        conversation_id = (chat_session_data or {}).get("conversation_id")
+        chat_history = []
+        if chat_session_id:
+            chat_history = await get_llm_chat_history_for_session(
+                agent_id,
+                chat_session_id,
+                conversation_id,
+                tool_calling_config,
+                llm_context_config,
+            )
+        logger.info(
+            f"{chat_log} load_session_agent_kb_ids done in {(time.perf_counter() - step_start) * 1000:.0f}ms "
+            f"(history_messages={len(chat_history)}, ready_kb_ids={len(ready_kb_ids)}, "
+            f"max_chat_history_messages={llm_context_config.get('max_chat_history_messages')}, "
+            f"include_tool_history={tool_calling_config.get('include_tool_history_in_llm')}, "
+            f"tool_calling_model={tool_calling_config.get('tool_calling_model')})"
+        )
+
+        monitor_sids = additional_params.get("_monitor_sids") or []
+        user_message_stored = False
+        if chat_session_id and monitor_sids:
+            early_stored = await create_and_store_chat_messages(
+                chat_session_id=chat_session_id,
+                agent_id=agent_id,
+                user_message_payload={
+                    "message_id": user_message_id,
+                    "role": "user",
+                    "content": message,
+                    "created_at": user_message_created_at,
+                },
+                agent_message_payload=None,
+            )
+            if early_stored:
+                user_message_stored = True
+                user_stored_doc = next(
+                    (doc for doc in early_stored if doc.get("role") == "user"),
+                    early_stored[0],
+                )
+                visitor_message_metadata = stored_message_metadata(user_stored_doc)
+
+                from services.elysium_atlas_services.atlas_team_member_emit_services import (
+                    emit_monitor_visitor_message,
+                )
+
+                asyncio.create_task(
+                    emit_monitor_visitor_message(
+                        monitor_sids,
+                        agent_id,
+                        chat_session_id,
+                        message,
+                        visitor_message_metadata,
+                    )
+                )
+                logger.info(f"{chat_log} Stored visitor message early for monitor mirror")
+
+        agent_name = chat_session_data.get("agent_name") if chat_session_data else None
+
+        retrieval_strategy = (agent_data or {}).get("retrieval_strategy") or DEFAULT_RETRIEVAL_STRATEGY
+        logger.info(f"{chat_log} Retrieving knowledge (strategy={retrieval_strategy})")
+        step_start = time.perf_counter()
+        final_results = await search_and_merge_agent_knowledge(
+            agent_id, message, retrieval_strategy, ready_kb_ids=ready_kb_ids
+        )
+        logger.info(
+            f"{chat_log} knowledge_retrieval done in {(time.perf_counter() - step_start) * 1000:.0f}ms "
+            f"(strategy={retrieval_strategy}, sources={len(final_results)})"
+        )
+        
+        if(agent_name):
+            agent_data["agent_name"] = agent_name
+
+        lead_collection_prompt = None
+        human_handover_prompt = None
+        if chat_session_id and not chat_session_data.get("in_conversation_with"):
+            from services.elysium_atlas_services.human_handover_services import (
+                is_handover_waiting,
+                process_handover_turn,
+            )
+
+            handover_turn = await process_handover_turn(
+                agent_id=agent_id,
+                chat_session_id=chat_session_id,
+                message=message,
+                chat_session_data=chat_session_data or {},
+                chat_history=chat_history,
+                handover_config=(agent_data or {}).get("human_handover_config"),
+            )
+            human_handover_prompt = handover_turn.get("prompt_block")
+            if handover_turn.get("handover_state") is not None:
+                chat_session_data["handover"] = handover_turn["handover_state"]
+
+            if not is_handover_waiting(handover_turn.get("handover_state") or {}):
+                from services.elysium_atlas_services.lead_collection_services import (
+                    process_lead_collection_turn,
+                )
+
+                lead_turn = await process_lead_collection_turn(
+                    agent_id=agent_id,
+                    chat_session_id=chat_session_id,
+                    message=message,
+                    chat_session_data=chat_session_data or {},
+                    chat_history=chat_history,
+                    lead_config=(agent_data or {}).get("lead_collection_config"),
+                    agent_data=agent_data,
+                )
+                lead_collection_prompt = lead_turn.get("prompt_block")
+                if lead_turn.get("lead_state") is not None:
+                    chat_session_data["lead_collection"] = lead_turn["lead_state"]
+            elif human_handover_prompt:
+                lead_collection_prompt = None
+
+        logger.info(f"{chat_log} Building LLM prompt with knowledge and chat history")
+        step_start = time.perf_counter()
+        knowledge_base_string = format_knowledge_base_string(final_results)
+        model = agent_data.get("llm_model") or DEFAULT_MODEL
+        handler, _ = resolve_model_handler(model)
+        tool_result_role = get_tool_result_message_role(model)
+        messages = build_messages_list(
+            agent_data,
+            message,
+            knowledge_base_string,
+            chat_history,
+            lead_collection_prompt=lead_collection_prompt,
+            human_handover_prompt=human_handover_prompt,
+        )
+
+        tool_ids = (agent_data or {}).get("tool_ids") or []
+        plugin_ids = (agent_data or {}).get("plugin_ids") or []
+        tool_turn_messages = None
+        if (tool_ids or plugin_ids) and tool_calling_config.get("enabled"):
+            logger.info(
+                f"{chat_log} Checking registered tools/plugins for this turn "
+                f"(tools={len(tool_ids)}, plugins={len(plugin_ids)})"
+            )
+            tool_temperature = agent_data.get("temperature", 0.5) if agent_data else 0.5
+            tool_step_start = time.perf_counter()
+            conversation_id = (chat_session_data or {}).get("conversation_id")
+            monitor_sids_for_tools = list(monitor_sids)
+
+            async def persist_and_emit_tool_call(record: dict) -> None:
+                stored = None
+                if chat_session_id:
+                    stored = await create_and_store_tool_call_message(
+                        chat_session_id=chat_session_id,
+                        agent_id=agent_id,
+                        conversation_id=conversation_id,
+                        parent_user_message_id=user_message_id,
+                        tool_name=record.get("tool_name") or "unknown",
+                        request_payload=record.get("request_payload"),
+                        response_payload=record.get("response_payload"),
+                        status=record.get("status") or "success",
+                        request_payload_truncated=bool(record.get("request_payload_truncated")),
+                        response_payload_truncated=bool(record.get("response_payload_truncated")),
+                        execution_kind=record.get("execution_kind"),
+                        created_at=record.get("created_at"),
+                    )
+                emit_payload = serialize_chat_message_for_client(stored) if stored else record
+                if monitor_sids_for_tools:
+                    from services.elysium_atlas_services.atlas_team_member_emit_services import (
+                        emit_monitor_tool_call,
+                    )
+                    await emit_monitor_tool_call(
+                        monitor_sids_for_tools,
+                        agent_id,
+                        chat_session_id,
+                        emit_payload,
+                    )
+
+            try:
+                tool_turn_messages = await run_agent_tool_calling_round(
+                    messages,
+                    tool_ids,
+                    plugin_ids=plugin_ids,
+                    tool_calling_config=tool_calling_config,
+                    temperature=tool_temperature,
+                    on_tool_call=persist_and_emit_tool_call,
+                )
+            except Exception as tool_error:
+                logger.error(f"{chat_log} Tool calling round failed: {tool_error}", exc_info=True)
+                tool_turn_messages = None
+            logger.info(
+                f"{chat_log} tool_calling_round done in {(time.perf_counter() - tool_step_start) * 1000:.0f}ms "
+                f"(tools_invoked={bool(tool_turn_messages)})"
+            )
+
+            if tool_turn_messages:
+                logger.info(
+                    f"{chat_log} Tool(s) invoked; rebuilding messages with tool results "
+                    f"(tool_messages={len(tool_turn_messages)})"
+                )
+                messages = build_messages_list(
+                    agent_data,
+                    message,
+                    knowledge_base_string,
+                    chat_history,
+                    tool_turn_messages=tool_turn_messages,
+                    tool_result_role=tool_result_role,
+                    lead_collection_prompt=lead_collection_prompt,
+                    human_handover_prompt=human_handover_prompt,
+                )
+            else:
+                logger.info(f"{chat_log} No tools invoked for this turn")
+        logger.info(
+            f"{chat_log} prepare_llm_messages done in {(time.perf_counter() - step_start) * 1000:.0f}ms "
+            f"(kb_chars={len(knowledge_base_string)}, message_count={len(messages)})"
+        )
+        
+        chat_payload = {
+            "model": model,
+            "messages": messages,
+        }
+        if "temperature" in agent_data:
+            chat_payload["temperature"] = agent_data.get("temperature",0.5)
+        
+        stream = False
+
+        if(sid):
+            stream = True
+            chat_payload["stream"] = stream
+
+        if additional_params.get("stream"):
+            stream = bool(additional_params["stream"])
+            chat_payload["stream"] = stream
+
+        logger.info(f"{chat_log} Generating agent response (model={model}, stream={stream})")
+        # logger.info(f"{chat_log} LLM messages: {json.dumps(messages, ensure_ascii=False)}")
+        llm_step_start = time.perf_counter()
+        response_obj = await handler(chat_payload)
+        logger.info(
+            f"{chat_log} llm_handler_returned in {(time.perf_counter() - llm_step_start) * 1000:.0f}ms "
+            f"(stream={stream})"
+        )
+
+        response_text = ""
+        agent_message_created_at = _utc_now()
+        stored_messages = None
+        if stream and hasattr(response_obj, "__aiter__"):
+            first_chunk_emitted = False
+            async for chunk in response_obj:
+                # Reasoning streams often yield empty deltas before visible text.
+                # Skipping them does not change the reply: the client appends chunk,
+                # and completion is the later done=true event with full_response.
+                if not chunk:
+                    continue
+                response_text += chunk
+                if sid:
+                    if not first_chunk_emitted:
+                        first_chunk_emitted = True
+                        if request_started_at is not None:
+                            ttft_ms = (time.perf_counter() - request_started_at) * 1000
+                            pre_llm_ms = (llm_step_start - request_started_at) * 1000
+                            logger.info(
+                                f"{chat_log} Time to first token: {ttft_ms:.0f}ms "
+                                f"(pre_llm={pre_llm_ms:.0f}ms, llm_to_first_token={(ttft_ms - pre_llm_ms):.0f}ms)"
+                            )
+                    await emit_atlas_response_chunk(chunk, done=False, sid=sid)
+
+            agent_mongo_id = None
+            if chat_session_id:
+                user_message_payload = None
+                if not user_message_stored:
+                    user_message_payload = {
+                        "message_id": user_message_id,
+                        "role": "user",
+                        "content": message,
+                        "created_at": user_message_created_at,
+                    }
+                stored_messages = await create_and_store_chat_messages(
+                    chat_session_id=chat_session_id,
+                    agent_id=agent_id,
+                    user_message_payload=user_message_payload,
+                    agent_message_payload={
+                        "message_id": agent_message_id,
+                        "role": "agent",
+                        "content": response_text,
+                        "created_at": agent_message_created_at,
+                    },
+                )
+                for stored in stored_messages:
+                    if stored.get("role") == "agent":
+                        agent_mongo_id = stored.get("_id")
+                        break
+                logger.info(f"{chat_log} Stored chat messages before final stream emit")
+
+            if sid:
+                await emit_atlas_response_chunk(
+                    "",
+                    done=True,
+                    sid=sid,
+                    full_response=response_text,
+                    message_id=agent_message_id,
+                    mongo_id=agent_mongo_id,
+                    created_at=format_utc_datetime_for_client(agent_message_created_at),
+                    role="agent",
+                )
+            
+            logger.info(
+                f"{chat_log} llm_streaming done in {(time.perf_counter() - llm_step_start) * 1000:.0f}ms "
+                f"(chars={len(response_text)})"
+            )
+        else:
+            response_text = response_obj
+
+        if chat_session_id and not (stream and sid):
+            user_message_payload = None
+            if not user_message_stored:
+                user_message_payload = {
+                    "message_id": user_message_id,
+                    "role": "user",
+                    "content": message,
+                    "created_at": user_message_created_at,
+                }
+            stored_messages = await create_and_store_chat_messages(
+                chat_session_id=chat_session_id,
+                agent_id=agent_id,
+                user_message_payload=user_message_payload,
+                agent_message_payload={
+                    "message_id": agent_message_id,
+                    "role": "agent",
+                    "content": response_text,
+                    "created_at": agent_message_created_at,
+                },
+            )
+            logger.info(f"{chat_log} Stored chat messages")
+
+        agent_message = None
+        if chat_session_id:
+            agent_message = _build_agent_message_from_stored(
+                stored_messages,
+                agent_message_id,
+                response_text,
+                agent_message_created_at,
+            )
+
+        logger.info(f"{chat_log} Visitor message processed successfully")
+
+        return {
+            "success": True,  
+            "results": final_results,
+            "knowledge_base": knowledge_base_string,
+            "messages": messages,
+            "message": "Search completed successfully.",
+            "agent_data": agent_data,
+            "response_text": response_text,
+            "chat_history": chat_history,
+            "agent_message": agent_message,
+        }
+    
+    except Exception as e:
+        logger.error(f"Error in chat_with_agent_v1: {e}")
+        return {"success": False, "message": "An error occurred while processing the chat."}

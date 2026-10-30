@@ -1,0 +1,78 @@
+"""
+Default atlas agent configuration.
+
+The ``llm_model`` field must be one of ``config.llm_models_config.SUPPORTED_LLM_MODELS``,
+including DeepSeek: ``deepseek-v4-flash``, ``deepseek-v4-pro``.
+"""
+from config.human_handover_config import get_default_human_handover_config
+from config.lead_collection_config import get_default_lead_collection_config
+from config.atlas_tool_calling_config import get_default_tool_calling_config
+from config.llm_context_config import get_default_llm_context_config
+
+USER_SETTABLE_AGENT_STATUSES = frozenset({"active", "inactive", "disabled"})
+
+DEPRECATED_AGENT_STORED_FIELDS = frozenset({"base_url"})
+
+ELYSIUM_ATLAS_AGENT_CONFIG_DATA = {
+    "agent_init_config": {
+        "agent_name": "my-agent",
+        "owner_user_id":None,
+        "team_id": None,
+        "agent_aliases":[],
+        "agent_icon":None,
+        "organization_name":None,
+        "llm_model":"gpt-4o-mini",
+        "welcome_message":"Hello, I am your AI assistant. How can I help you today?",
+        "placeholder_text":"Enter your message here...",
+        "primary_color":"#ffffff",
+        "secondary_color":"#ffffff",
+        "text_color":"#000000",
+        "quick_prompts":[],
+        "footer":None,
+        "agent_status":"inactive",
+        "agent_current_task": "initializing",
+        "system_prompt":"You are a helpful assistant.",
+        "temperature":0.5,
+        "retrieval_strategy": "simple",
+        "widget_script": None,
+        "lead_collection_config": get_default_lead_collection_config(),
+        "human_handover_config": get_default_human_handover_config(),
+        "tool_ids": [],
+        "plugin_ids": [],
+        "tool_calling_config": get_default_tool_calling_config(),
+        "llm_context_config": get_default_llm_context_config(),
+    },
+    "agent_task_progress": {
+        "initializing": 0,
+        "updating agent metadata": 2,
+        "Indexing Links": 5,
+        "Links Indexed": 25,
+        "Indexing Files": 30,
+        "Files Indexed": 50,
+        "Indexing Custom Knowledge": 75,
+        "Custom Knowledge Indexed": 90,
+        "running": 100,
+    },
+    "agent_chat_limits": {
+        "max_visitor_message_chars": 4000,
+    },
+    "visitor_presence_config": {
+        "stale_visitor_threshold_seconds": 1800,
+    },
+    "scheduler_config": {
+        "stale_visitor_cleanup_interval_minutes": 15,
+    },
+    "chat_session_init_config": {
+        "chat_session_id": None,
+        "created_at": None,
+        "last_message_at": None,
+        "agent_name": None,
+        "agent_id": None,
+        "channel": None,
+        "status": "active",
+        "visitor_at": None,
+        "visitor_online": False,
+        "source": None,
+        "in_conversation_with": None,
+    },
+}

@@ -1,0 +1,35 @@
+from fastapi import APIRouter
+from config.settings import settings
+
+from routes.elysium_atlas.elysium_atlas_routes import elysium_atlas_router
+from routes.elysium_atlas.user_auth_routes import elysium_atlas_user_auth_router
+from routes.elysium_atlas.elysium_atlas_agent_routes import elysium_atlas_agent_router
+from routes.elysium_atlas.atlas_visitors_routes import atlas_visitors_router
+from routes.elysium_atlas.atlas_team_members_routes import atlas_team_members_router
+from routes.elysium_atlas.atlas_tools_routes import atlas_tools_router
+from routes.elysium_atlas.atlas_plugin_routes import atlas_plugins_router
+from routes.elysium_atlas.atlas_kb_items_routes import atlas_kb_items_router
+from routes.elysium_atlas.atlas_support_tickets_routes import atlas_support_tickets_router
+from routes.elysium_atlas.human_handover_routes import human_handover_router
+from routes.elysium_atlas.lead_collection_routes import lead_collection_router
+from routes.elysium_atlas.atlas_dashboard_routes import atlas_dashboard_router
+from routes.demo.demo_customer_inquiry_routes import demo_customer_inquiry_router
+from routes.elysium_chat_routers.elysium_chat_router import elysium_chat_router
+
+# Create the main router with a prefix
+main_router = APIRouter(prefix = "/elysium-agents")
+
+main_router.include_router(elysium_atlas_router)
+main_router.include_router(elysium_atlas_user_auth_router)
+main_router.include_router(elysium_atlas_agent_router)
+main_router.include_router(atlas_visitors_router)
+main_router.include_router(atlas_team_members_router)
+main_router.include_router(atlas_tools_router)
+main_router.include_router(atlas_plugins_router)
+main_router.include_router(atlas_kb_items_router)
+main_router.include_router(atlas_support_tickets_router)
+main_router.include_router(human_handover_router)
+main_router.include_router(lead_collection_router)
+main_router.include_router(atlas_dashboard_router)
+main_router.include_router(demo_customer_inquiry_router)
+main_router.include_router(elysium_chat_router)
